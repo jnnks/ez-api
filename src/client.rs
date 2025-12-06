@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     marker::PhantomData,
     net::{SocketAddr, TcpStream},
     sync::{
@@ -7,36 +7,42 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    time::Duration,
 };
 
 use crate::{Codec, Continue};
 
+#[derive(Debug)]
 pub enum SendError {
     IoError(std::io::Error),
 
     Offline,
 }
 
+#[derive(Debug)]
 pub enum ReceiveError<TCodecErr> {
     IoError(std::io::Error),
     Empty,
     Codec(TCodecErr),
 }
 
-pub struct Client<Tin, Tout> {
+pub struct Client<Tin, Tout, C> {
     writer: TcpStream,
     online: Arc<AtomicBool>,
+    codec: C,
     _marker: PhantomData<(Tin, Tout)>,
 }
 
-impl<Tin, Tout> Client<Tin, Tout>
+impl<Tin, Tout, C> Client<Tin, Tout, C>
 where
     Tin: Send + 'static,
     Tout: Send,
+    C: Codec<Tin, Tout>,
 {
     /// Connect to a remote server.
-    pub async fn connect<C>(
+    pub fn connect(
         addr: SocketAddr,
+        codec: C,
         sink: mpsc::Sender<Result<Tin, ReceiveError<C::TErr>>>,
     ) -> std::io::Result<Self>
     where
@@ -47,18 +53,26 @@ where
 
         let online = Arc::new(AtomicBool::new(true));
         let online2 = online.clone();
+        let codec2 = codec.clone();
 
         std::thread::spawn(move || {
+            reader
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+
             loop {
                 let buffer = match Self::receive_next(&mut reader) {
                     Ok(buf) => buf,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        continue;
+                    }
                     Err(e) => {
-                        let _ = sink.send(Err(e));
+                        let _ = sink.send(Err(ReceiveError::IoError(e)));
                         break;
                     }
                 };
 
-                let message = match C::decode(buffer) {
+                let message = match codec2.decode(buffer) {
                     Ok(m) => m,
 
                     Err((e, Continue(true))) => {
@@ -86,28 +100,25 @@ where
         Ok(Self {
             writer,
             online,
+            codec,
             _marker: PhantomData,
         })
     }
 
-    fn receive_next<CErr>(reader: &mut TcpStream) -> Result<Vec<u8>, ReceiveError<CErr>> {
+    fn receive_next(reader: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
         // read next packet length
         let mut length_bytes = [0u8; 4];
-        reader
-            .read_exact(&mut length_bytes)
-            .map_err(|e| ReceiveError::IoError(e))?;
+        reader.read_exact(&mut length_bytes)?;
         let len = u32::from_be_bytes(length_bytes);
 
         if len == 0 {
-            return Err(ReceiveError::Empty);
+            return Ok(vec![]);
         }
 
         // read next packet
         let mut message_buffer = vec![0u8; len as usize];
-        reader
-            .read_exact(&mut message_buffer)
-            .map_err(|e| ReceiveError::IoError(e))?;
-
+        reader.read_exact(&mut message_buffer)?;
+        // println!("client recv buffer {:?}", &message_buffer);
         Ok(message_buffer)
     }
 
@@ -124,14 +135,16 @@ where
     }
 
     /// Send a Json-serializable message
-    pub async fn send<C>(&mut self, message: &Tout) -> Result<(), SendError>
-    where
-        C: Codec<Tin, Tout>,
-    {
+    pub fn send(&mut self, message: Tout) -> Result<(), SendError> {
         if self.online.load(Ordering::SeqCst) {
-            let m = C::encode(message);
+            let m = self.codec.encode(message);
 
-            self.writer.write_all(m).map_err(SendError::IoError)?;
+            let len = m.len() as u32;
+            println!("client sending: {len} {:?}", &m);
+            self.writer
+                .write_all(&len.to_be_bytes())
+                .map_err(SendError::IoError)?;
+            self.writer.write_all(&m).map_err(SendError::IoError)?;
             self.writer.flush().map_err(SendError::IoError)?;
 
             Ok(())

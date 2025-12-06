@@ -1,54 +1,48 @@
 pub mod client;
 pub mod server;
-
 pub use client::Client;
+pub use server::Server;
 
 pub struct Continue(pub bool);
 
-pub trait Codec<Tin, Tout> {
+pub trait Codec<Tin, Tout>: Clone + Send + 'static {
     type TErr: Send + 'static;
 
-    fn encode(outgoing: &Tout) -> &[u8];
-    fn decode(incoming: Vec<u8>) -> Result<Tin, (Self::TErr, Continue)>;
+    fn encode(&self, outgoing: Tout) -> Vec<u8>;
+    fn decode(&self, incoming: Vec<u8>) -> Result<Tin, (Self::TErr, Continue)>;
 }
 
-// fn read_json<Tin, S>(_source: &mut S) -> Result<Tin, ReceiveError>
-// where
-//     Tin: DeserializeOwned,
-//     S: Read,
-// {
-//     todo!()
-//     // // read next packet length
-//     // let mut length_bytes = [0u8; 4];
-//     // source.read_exact(&mut length_bytes).await?;
-//     // let len = u32::from_be_bytes(length_bytes);
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
 
-//     // if len == 0 {
-//     //     // return early when receiving data of size 0
-//     //     return Err(ReceiveError::ProtocolError);
-//     // }
+    use crate::{Client, Codec, Continue, Server, server::Event};
 
-//     // // read next packet
-//     // let mut mesage_buffer = vec![0u8; len as usize];
-//     // source.read_exact(&mut mesage_buffer).await?;
-//     // match serde_json::from_slice(&mesage_buffer) {
-//     //     Ok(json) => Ok(json),
-//     //     Err(e) => {
-//     //         error!("Error while reading JSON data:\n\n{e}\n\n{JSON_DECODE_ERROR}");
-//     //         Err(ReceiveError::JsonError(e))
-//     //     }
-//     // }
-// }
+    #[derive(Clone)]
+    struct StringCodec;
+    impl Codec<String, String> for StringCodec {
+        type TErr = String;
+        fn encode(&self, outgoing: String) -> Vec<u8> {
+            outgoing.into_bytes()
+        }
+        fn decode(&self, incoming: Vec<u8>) -> Result<String, (String, Continue)> {
+            Ok(String::from_utf8(incoming).unwrap())
+        }
+    }
 
-// fn write_json<Tout, S>(_sink: &mut S, _value: Tout) -> Result<(), SendError>
-// where
-//     Tout: Serialize,
-//     S: Write,
-// {
-//     todo!()
-//     // let json_bytes = serde_json::to_vec(&value)?;
-//     // let length_bytes = u32::to_be_bytes(json_bytes.len() as u32);
-//     // sink.write_all(&length_bytes).await?;
-//     // sink.write_all(&json_bytes).await?;
-//     // Ok(())
-// }
+    type StringServer = Server<String, String, StringCodec>;
+    type StringClient = Client<String, String, StringCodec>;
+
+    #[test]
+    fn test_trivial() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let _server: StringServer = Server::bind(addr, StringCodec {}, sink).unwrap();
+        let (sink, _clt_rx) = std::sync::mpsc::channel();
+        let client: StringClient = Client::connect(addr, StringCodec {}, sink).unwrap();
+
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+        drop(client);
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Disconnect))));
+    }
+}

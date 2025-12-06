@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
+use std::time::Duration;
 
 use crate::{Codec, Continue};
 
@@ -42,20 +43,22 @@ pub enum ReceiveError<TCodecErr> {
     Codec(TCodecErr),
 }
 
-pub struct Server<Tin, Tout> {
+pub struct Server<Tin, Tout, C> {
     local_addr: SocketAddr,
     connections: Arc<RwLock<HashMap<SocketAddr, SenderWithResult<Tout>>>>,
     shutdown: Arc<AtomicBool>,
-    _marker: PhantomData<Tin>,
+    _marker: PhantomData<(Tin, C)>,
 }
 
-impl<Tin, Tout> Server<Tin, Tout>
+impl<Tin, Tout, C> Server<Tin, Tout, C>
 where
-    Tin: Send + 'static,
-    Tout: Send + 'static,
+    Tin: Send + 'static + Debug,
+    Tout: Send + 'static + Debug,
+    C: Codec<Tin, Tout> + Clone + 'static,
 {
-    pub fn bind<C>(
+    pub fn bind(
         addr: SocketAddr,
+        codec: C,
         sink: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
     ) -> std::io::Result<Self>
     where
@@ -76,7 +79,7 @@ where
         let shutdown2 = shutdown.clone();
 
         std::thread::spawn(move || {
-            Self::accept_connections::<C>(listener, connections2.clone(), sink, shutdown2);
+            Self::accept_connections(listener, connections2.clone(), sink, codec, shutdown2);
 
             // accept_connections will only finish, once it received the shutdown signal.
             // We need to clear exising connections here, so that we do not leak resources.
@@ -93,9 +96,6 @@ where
 
     pub fn send(&self, who: SocketAddr, value: Tout) -> Result<(), SendError> {
         if let Some(conn) = self.connections.read().unwrap().get(&who) {
-            // We build a oneshot channel to make sure, the message was sent.
-            //   The channel will receive either "()" or a SendError, which will
-            //   be forwarded to the caller of this function.
             let (tx, rx) = mpsc::channel();
             conn.send((tx, value))
                 .map_err(|_| SendError::BrokenChannel)?;
@@ -121,14 +121,13 @@ where
         self.local_addr
     }
 
-    fn accept_connections<C>(
+    fn accept_connections(
         listener: TcpListener,
         connections: Arc<RwLock<HashMap<SocketAddr, SenderWithResult<Tout>>>>,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
+        codec: C,
         shutdown: Arc<AtomicBool>,
-    ) where
-        C: Codec<Tin, Tout>,
-    {
+    ) {
         loop {
             match listener.accept() {
                 Err(e) => match e.kind() {
@@ -143,22 +142,22 @@ where
                 Ok((socket, addr)) => {
                     let connections2 = connections.clone();
                     let data_tx2 = data_tx.clone();
+                    let codec2 = codec.clone();
                     std::thread::spawn(move || {
-                        Self::handle_connection::<C>(addr, socket, connections2, data_tx2)
+                        Self::handle_connection(addr, socket, codec2, connections2, data_tx2)
                     });
                 }
             }
         }
     }
 
-    fn handle_connection<C>(
+    fn handle_connection(
         addr: SocketAddr,
         stream: TcpStream,
+        codec: C,
         connections: Arc<RwLock<HashMap<SocketAddr, SenderWithResult<Tout>>>>,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
-    ) where
-        C: Codec<Tin, Tout>,
-    {
+    ) {
         // Split the socket into a read and write half
         let (reader, writer) = (stream.try_clone().unwrap(), stream);
 
@@ -167,31 +166,35 @@ where
         connections.write().unwrap().insert(addr, client_tx);
         data_tx.send((addr, Event::Connect)).unwrap();
 
+        let codec2 = codec.clone();
         // send and receive all messages
-        std::thread::spawn(move || Self::send_messages::<C>(client_rx, writer));
-        Self::read_messages::<C>(addr, reader, data_tx.clone());
+        std::thread::spawn(move || Self::send_messages(client_rx, codec2, writer));
+        Self::read_messages(addr, reader, codec, data_tx.clone());
 
         connections.write().unwrap().remove(&addr);
         data_tx.send((addr, Event::Disconnect)).unwrap();
     }
 
-    fn read_messages<C>(
+    fn read_messages(
         peer: SocketAddr,
         mut reader: TcpStream,
+        codec: C,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
-    ) where
-        C: Codec<Tin, Tout>,
-    {
+    ) {
+        reader
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         loop {
             let buffer = match Self::receive_next(&mut reader) {
-                Ok(buf) => buf,
+                Ok(None) => break,
+                Ok(Some(mesg)) => mesg,
                 Err(e) => {
                     let _ = data_tx.send((peer, Event::Err(e)));
                     break;
                 }
             };
 
-            let message = match C::decode(buffer) {
+            let message = match codec.decode(buffer) {
                 Ok(m) => m,
 
                 Err((e, Continue(true))) => {
@@ -211,19 +214,26 @@ where
                 }
             };
 
+            println!("server recv: {:?}", &message);
             if data_tx.send((peer, Event::Data(message))).is_err() {
                 break;
             }
         }
+        println!("server receive loop done");
     }
 
-    fn receive_next<CErr>(reader: &mut TcpStream) -> Result<Vec<u8>, ReceiveError<CErr>> {
+    fn receive_next<CErr>(reader: &mut TcpStream) -> Result<Option<Vec<u8>>, ReceiveError<CErr>> {
         // read next packet length
         let mut length_bytes = [0u8; 4];
-        reader
-            .read_exact(&mut length_bytes)
-            .map_err(|e| ReceiveError::IoError(e))?;
+        match reader.read_exact(&mut length_bytes) {
+            Ok(_) => { /* ok */ }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                return Ok(None);
+            }
+            Err(e) => return Err(ReceiveError::IoError(e)),
+        }
         let len = u32::from_be_bytes(length_bytes);
+        println!("client recv len {len}");
 
         if len == 0 {
             return Err(ReceiveError::Empty);
@@ -231,25 +241,31 @@ where
 
         // read next packet
         let mut message_buffer = vec![0u8; len as usize];
-        reader
-            .read_exact(&mut message_buffer)
-            .map_err(|e| ReceiveError::IoError(e))?;
-
-        Ok(message_buffer)
+        match reader.read_exact(&mut message_buffer) {
+            Ok(_) => { /* ok */ }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => println!("would block"),
+            Err(e) => return Err(ReceiveError::IoError(e)),
+        }
+        // println!("client recv buffer {:?}", &message_buffer);
+        Ok(Some(message_buffer))
     }
 
-    fn send_messages<C>(
+    fn send_messages(
         client_rx: ReceiverWithResult<Tout>,
+        codec: C,
         mut writer: TcpStream,
-    ) -> Result<(), SendError>
-    where
-        C: Codec<Tin, Tout>,
-    {
+    ) -> Result<(), SendError> {
         while let Ok((tx_result, message)) = client_rx.recv() {
-            let m = C::encode(&message);
+            let m = codec.encode(message);
+            let len = m.len() as u32;
+            println!("server sending: {len} {:?}", &m);
 
             let result: Result<(), SendError> = {
-                writer.write_all(m).map_err(SendError::IoError)?;
+                writer
+                    .write_all(&len.to_be_bytes())
+                    .map_err(SendError::IoError)?;
+
+                writer.write_all(&m).map_err(SendError::IoError)?;
                 writer.flush().map_err(SendError::IoError)?;
 
                 Ok(())
@@ -262,7 +278,7 @@ where
     }
 }
 
-impl<Tin, Tout> Drop for Server<Tin, Tout> {
+impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
     fn drop(&mut self) {
         // Send shutdown signal to acceptor task.
         //   This will terminate the accept loop and close all exisitng connections.
