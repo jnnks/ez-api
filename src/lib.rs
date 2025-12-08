@@ -1,12 +1,14 @@
 pub mod client;
 pub mod server;
+use std::fmt::Debug;
+
 pub use client::Client;
 pub use server::Server;
 
 pub struct Continue(pub bool);
 
 pub trait Codec<Tin, Tout>: Clone + Send + 'static {
-    type TErr: Send + 'static;
+    type TErr: Send + Debug + 'static;
 
     fn encode(&self, outgoing: Tout) -> Vec<u8>;
     fn decode(&self, incoming: Vec<u8>) -> Result<Tin, (Self::TErr, Continue)>;
@@ -16,7 +18,10 @@ pub trait Codec<Tin, Tout>: Clone + Send + 'static {
 mod tests {
     use std::net::SocketAddr;
 
-    use crate::{Client, Codec, Continue, Server, server::Event};
+    use crate::{
+        Client, Codec, Continue, Server,
+        server::{Event, ReceiveError},
+    };
 
     #[derive(Clone)]
     struct StringCodec;
@@ -43,6 +48,10 @@ mod tests {
 
         assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
         drop(client);
+        assert!(matches!(
+            srv_rx.recv(),
+            Ok((_, Event::Err(ReceiveError::IoError(_))))
+        ));
         assert!(matches!(srv_rx.recv(), Ok((_, Event::Disconnect))));
     }
 }

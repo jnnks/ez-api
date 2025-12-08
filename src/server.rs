@@ -181,15 +181,11 @@ where
         codec: C,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
     ) {
-        reader
-            .set_read_timeout(Some(Duration::from_millis(10)))
-            .unwrap();
         loop {
             let buffer = match Self::receive_next(&mut reader) {
-                Ok(None) => break,
-                Ok(Some(mesg)) => mesg,
+                Ok(mesg) => mesg,
                 Err(e) => {
-                    let _ = data_tx.send((peer, Event::Err(e)));
+                    let _ = data_tx.send((peer, Event::Err(ReceiveError::IoError(e))));
                     break;
                 }
             };
@@ -219,35 +215,25 @@ where
                 break;
             }
         }
+        reader.shutdown(std::net::Shutdown::Both).unwrap();
         println!("server receive loop done");
     }
 
-    fn receive_next<CErr>(reader: &mut TcpStream) -> Result<Option<Vec<u8>>, ReceiveError<CErr>> {
+    fn receive_next(reader: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
         // read next packet length
         let mut length_bytes = [0u8; 4];
-        match reader.read_exact(&mut length_bytes) {
-            Ok(_) => { /* ok */ }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                return Ok(None);
-            }
-            Err(e) => return Err(ReceiveError::IoError(e)),
-        }
-        let len = u32::from_be_bytes(length_bytes);
+        reader.read_exact(&mut length_bytes)?;
+        let len = u32::from_ne_bytes(length_bytes);
         println!("client recv len {len}");
 
         if len == 0 {
-            return Err(ReceiveError::Empty);
+            return Ok(vec![]);
         }
 
         // read next packet
-        let mut message_buffer = vec![0u8; len as usize];
-        match reader.read_exact(&mut message_buffer) {
-            Ok(_) => { /* ok */ }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => println!("would block"),
-            Err(e) => return Err(ReceiveError::IoError(e)),
-        }
-        // println!("client recv buffer {:?}", &message_buffer);
-        Ok(Some(message_buffer))
+        let message_buffer = vec![0u8; len as usize];
+        reader.read_exact(&mut length_bytes)?;
+        Ok(message_buffer)
     }
 
     fn send_messages(
@@ -262,7 +248,7 @@ where
 
             let result: Result<(), SendError> = {
                 writer
-                    .write_all(&len.to_be_bytes())
+                    .write_all(&len.to_ne_bytes())
                     .map_err(SendError::IoError)?;
 
                 writer.write_all(&m).map_err(SendError::IoError)?;

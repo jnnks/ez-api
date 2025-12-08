@@ -7,7 +7,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
 };
 
 use crate::{Codec, Continue};
@@ -56,45 +55,14 @@ where
         let codec2 = codec.clone();
 
         std::thread::spawn(move || {
-            reader
-                .set_read_timeout(Some(Duration::from_millis(10)))
-                .unwrap();
-
-            loop {
-                let buffer = match Self::receive_next(&mut reader) {
-                    Ok(buf) => buf,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = sink.send(Err(ReceiveError::IoError(e)));
-                        break;
-                    }
-                };
-
-                let message = match codec2.decode(buffer) {
-                    Ok(m) => m,
-
-                    Err((e, Continue(true))) => {
-                        if sink.send(Err(ReceiveError::Codec(e))).is_err() {
-                            break;
-                        }
-
-                        continue;
-                    }
-
-                    Err((e, Continue(false))) => {
-                        let _ = sink.send(Err(ReceiveError::Codec(e)));
-                        break;
-                    }
-                };
-
-                if sink.send(Ok(message)).is_err() {
-                    break;
-                }
-            }
+            Self::receive_messages(&mut reader, codec2, sink);
 
             online2.store(false, Ordering::SeqCst);
+            match reader.shutdown(std::net::Shutdown::Both) {
+                Ok(()) => { /* ok */ }
+                Err(e) if e.kind() == ErrorKind::NotConnected => { /* ignore */ }
+                Err(e) => panic!("Failed to shutdown reader half: {e}"),
+            }
         });
 
         Ok(Self {
@@ -105,11 +73,49 @@ where
         })
     }
 
+    fn receive_messages(
+        reader: &mut TcpStream,
+        codec: C,
+        sink: mpsc::Sender<Result<Tin, ReceiveError<C::TErr>>>,
+    ) {
+        loop {
+            let buffer = match Self::receive_next(reader) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    let _ = sink.send(Err(ReceiveError::IoError(e)));
+                    break;
+                }
+            };
+
+            let message = match codec.decode(buffer) {
+                Ok(m) => m,
+
+                Err((e, Continue(true))) => {
+                    if sink.send(Err(ReceiveError::Codec(e))).is_err() {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                Err((e, Continue(false))) => {
+                    // we will break anyway, so we can also ignore the sink.send error
+                    let _ = sink.send(Err(ReceiveError::Codec(e)));
+                    break;
+                }
+            };
+
+            if sink.send(Ok(message)).is_err() {
+                break;
+            }
+        }
+    }
+
     fn receive_next(reader: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
         // read next packet length
         let mut length_bytes = [0u8; 4];
         reader.read_exact(&mut length_bytes)?;
-        let len = u32::from_be_bytes(length_bytes);
+        let len = u32::from_ne_bytes(length_bytes);
 
         if len == 0 {
             return Ok(vec![]);
@@ -142,7 +148,7 @@ where
             let len = m.len() as u32;
             println!("client sending: {len} {:?}", &m);
             self.writer
-                .write_all(&len.to_be_bytes())
+                .write_all(&len.to_ne_bytes())
                 .map_err(SendError::IoError)?;
             self.writer.write_all(&m).map_err(SendError::IoError)?;
             self.writer.flush().map_err(SendError::IoError)?;
@@ -151,5 +157,11 @@ where
         } else {
             Err(SendError::Offline)
         }
+    }
+}
+
+impl<Tin, Tout, C> Drop for Client<Tin, Tout, C> {
+    fn drop(&mut self) {
+        self.writer.shutdown(std::net::Shutdown::Both).unwrap();
     }
 }
