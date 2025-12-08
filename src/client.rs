@@ -21,7 +21,6 @@ pub enum SendError {
 #[derive(Debug)]
 pub enum ReceiveError<TCodecErr> {
     IoError(std::io::Error),
-    Empty,
     Codec(TCodecErr),
 }
 

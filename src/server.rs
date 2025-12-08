@@ -5,7 +5,6 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
-use std::time::Duration;
 
 use crate::{Codec, Continue};
 
@@ -37,8 +36,6 @@ pub enum SendError {
 #[derive(Debug)]
 pub enum ReceiveError<TCodecErr> {
     IoError(std::io::Error),
-
-    Empty,
 
     Codec(TCodecErr),
 }
