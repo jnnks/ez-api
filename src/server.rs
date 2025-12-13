@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,7 +179,7 @@ where
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
     ) {
         loop {
-            let buffer = match Self::receive_next(&mut reader) {
+            let buffer = match crate::read_write::receive_next(&mut reader) {
                 Ok(mesg) => mesg,
                 Err(e) => {
                     let _ = data_tx.send((peer, Event::Err(ReceiveError::IoError(e))));
@@ -207,30 +207,11 @@ where
                 }
             };
 
-            println!("server recv: {:?}", &message);
             if data_tx.send((peer, Event::Data(message))).is_err() {
                 break;
             }
         }
         reader.shutdown(std::net::Shutdown::Both).unwrap();
-        println!("server receive loop done");
-    }
-
-    fn receive_next(reader: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
-        // read next packet length
-        let mut length_bytes = [0u8; 4];
-        reader.read_exact(&mut length_bytes)?;
-        let len = u32::from_ne_bytes(length_bytes);
-        println!("client recv len {len}");
-
-        if len == 0 {
-            return Ok(vec![]);
-        }
-
-        // read next packet
-        let message_buffer = vec![0u8; len as usize];
-        reader.read_exact(&mut length_bytes)?;
-        Ok(message_buffer)
     }
 
     fn send_messages(
@@ -240,19 +221,8 @@ where
     ) -> Result<(), SendError> {
         while let Ok((tx_result, message)) = client_rx.recv() {
             let m = codec.encode(message);
-            let len = m.len() as u32;
-            println!("server sending: {len} {:?}", &m);
-
-            let result: Result<(), SendError> = {
-                writer
-                    .write_all(&len.to_ne_bytes())
-                    .map_err(SendError::IoError)?;
-
-                writer.write_all(&m).map_err(SendError::IoError)?;
-                writer.flush().map_err(SendError::IoError)?;
-
-                Ok(())
-            };
+            let result: Result<(), SendError> =
+                crate::read_write::write(&mut writer, &m).map_err(SendError::IoError);
 
             let _ = tx_result.send(result);
         }

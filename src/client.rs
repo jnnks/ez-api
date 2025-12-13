@@ -1,5 +1,5 @@
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::ErrorKind,
     marker::PhantomData,
     net::{SocketAddr, TcpStream},
     sync::{
@@ -78,7 +78,7 @@ where
         sink: mpsc::Sender<Result<Tin, ReceiveError<C::TErr>>>,
     ) {
         loop {
-            let buffer = match Self::receive_next(reader) {
+            let buffer = match crate::read_write::receive_next(reader) {
                 Ok(buf) => buf,
                 Err(e) => {
                     let _ = sink.send(Err(ReceiveError::IoError(e)));
@@ -110,23 +110,6 @@ where
         }
     }
 
-    fn receive_next(reader: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
-        // read next packet length
-        let mut length_bytes = [0u8; 4];
-        reader.read_exact(&mut length_bytes)?;
-        let len = u32::from_ne_bytes(length_bytes);
-
-        if len == 0 {
-            return Ok(vec![]);
-        }
-
-        // read next packet
-        let mut message_buffer = vec![0u8; len as usize];
-        reader.read_exact(&mut message_buffer)?;
-        // println!("client recv buffer {:?}", &message_buffer);
-        Ok(message_buffer)
-    }
-
     /// Return whether the connection is healthy
     pub fn online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
@@ -143,14 +126,7 @@ where
     pub fn send(&mut self, message: Tout) -> Result<(), SendError> {
         if self.online.load(Ordering::SeqCst) {
             let m = self.codec.encode(message);
-
-            let len = m.len() as u32;
-            println!("client sending: {len} {:?}", &m);
-            self.writer
-                .write_all(&len.to_ne_bytes())
-                .map_err(SendError::IoError)?;
-            self.writer.write_all(&m).map_err(SendError::IoError)?;
-            self.writer.flush().map_err(SendError::IoError)?;
+            crate::read_write::write(&mut self.writer, &m).map_err(SendError::IoError)?;
 
             Ok(())
         } else {

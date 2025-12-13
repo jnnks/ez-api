@@ -14,6 +14,40 @@ pub trait Codec<Tin, Tout>: Clone + Send + 'static {
     fn decode(&self, incoming: Vec<u8>) -> Result<Tin, (Self::TErr, Continue)>;
 }
 
+mod read_write {
+    use std::io::{Read, Write};
+
+    pub fn receive_next(reader: &mut std::net::TcpStream) -> Result<Vec<u8>, std::io::Error> {
+        let len = {
+            // read next packet length
+            let mut length_bytes = [0u8; 4];
+            reader.read_exact(&mut length_bytes)?;
+            u32::from_ne_bytes(length_bytes)
+        };
+
+        if len == 0 {
+            return Ok(vec![]);
+        }
+
+        let message_buffer = {
+            // read next packet
+            let mut message_buffer = vec![0u8; len as usize];
+            reader.read_exact(&mut message_buffer)?;
+            message_buffer
+        };
+        Ok(message_buffer)
+    }
+
+    pub fn write(sink: &mut std::net::TcpStream, buf: &[u8]) -> Result<(), std::io::Error> {
+        let len = buf.len() as u32;
+        sink.write_all(&len.to_ne_bytes())?;
+        sink.write_all(&buf)?;
+        sink.flush()?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
