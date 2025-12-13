@@ -1,5 +1,4 @@
 use std::{
-    io::ErrorKind,
     marker::PhantomData,
     net::{SocketAddr, TcpStream},
     sync::{
@@ -57,11 +56,7 @@ where
             Self::receive_messages(&mut reader, codec2, sink);
 
             online2.store(false, Ordering::SeqCst);
-            match reader.shutdown(std::net::Shutdown::Both) {
-                Ok(()) => { /* ok */ }
-                Err(e) if e.kind() == ErrorKind::NotConnected => { /* ignore */ }
-                Err(e) => panic!("Failed to shutdown reader half: {e}"),
-            }
+            let _ = reader.shutdown(std::net::Shutdown::Both);
         });
 
         Ok(Self {
@@ -137,6 +132,6 @@ where
 
 impl<Tin, Tout, C> Drop for Client<Tin, Tout, C> {
     fn drop(&mut self) {
-        self.writer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 }
