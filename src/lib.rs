@@ -137,4 +137,60 @@ mod tests {
         ));
         assert!(!client.online());
     }
+
+    #[test]
+    fn test_send_recv_1() {
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let server: StringServer = Server::bind(ANY_ADDR, StringCodec {}, sink).unwrap();
+
+        let (sink, clt_rx) = std::sync::mpsc::channel();
+        let mut client: StringClient =
+            Client::connect(server.local_addr(), StringCodec {}, sink).unwrap();
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+
+        client.send("hello".into()).unwrap();
+        let Ok((_, Event::Data(data))) = srv_rx.recv() else {
+            panic!("recv failed")
+        };
+        assert_eq!("hello", &data);
+
+        server.send(client.local_addr(), "hello".into()).unwrap();
+        let Ok(Ok(msg)) = clt_rx.recv() else {
+            panic!("recv failed")
+        };
+        assert_eq!("hello", &msg);
+    }
+
+    #[test]
+    fn test_send_recv_2() {
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let server: StringServer = Server::bind(ANY_ADDR, StringCodec {}, sink).unwrap();
+
+        let (sink, clt_rx) = std::sync::mpsc::channel();
+        let mut client: StringClient =
+            Client::connect(server.local_addr(), StringCodec {}, sink).unwrap();
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+
+        for _ in 0..100 {
+            client.send("hello".into()).unwrap();
+        }
+
+        for _ in 0..100 {
+            let Ok((_, Event::Data(data))) = srv_rx.recv() else {
+                panic!("recv failed")
+            };
+            assert_eq!("hello", &data);
+        }
+
+        for _ in 0..100 {
+            server.send(client.local_addr(), "hello".into()).unwrap();
+        }
+
+        for _ in 0..100 {
+            let Ok(Ok(msg)) = clt_rx.recv() else {
+                panic!("recv failed")
+            };
+            assert_eq!("hello", &msg);
+        }
+    }
 }

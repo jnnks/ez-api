@@ -110,6 +110,12 @@ where
         self.online.load(Ordering::SeqCst)
     }
 
+    pub fn local_addr(&self) -> SocketAddr {
+        self.writer
+            .local_addr()
+            .expect("Cannot Retrieve Local Address")
+    }
+
     // Returns the server address
     pub fn peer_addr(&self) -> SocketAddr {
         self.writer
