@@ -53,7 +53,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use crate::{
-        Client, Codec, Continue, Server,
+        Client, Codec, Continue, Server, client,
         server::{Event, ReceiveError},
     };
 
@@ -73,7 +73,7 @@ mod tests {
     type StringClient = Client<String, String, StringCodec>;
 
     #[test]
-    fn test_trivial() {
+    fn test_connect_disconnect_1() {
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let (sink, srv_rx) = std::sync::mpsc::channel();
         let _server: StringServer = Server::bind(addr, StringCodec {}, sink).unwrap();
@@ -87,5 +87,25 @@ mod tests {
             Ok((_, Event::Err(ReceiveError::IoError(_))))
         ));
         assert!(matches!(srv_rx.recv(), Ok((_, Event::Disconnect))));
+    }
+
+    #[test]
+    fn test_connect_disconnect_2() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+
+        let server: StringServer = Server::bind(addr, StringCodec {}, sink).unwrap();
+
+        let (sink, clt_rx) = std::sync::mpsc::channel();
+        let client: StringClient = Client::connect(addr, StringCodec {}, sink).unwrap();
+
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+        drop(server);
+
+        assert!(matches!(
+            clt_rx.recv().unwrap(),
+            Err(client::ReceiveError::IoError(_))
+        ));
+        assert!(!client.online());
     }
 }
