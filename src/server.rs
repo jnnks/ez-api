@@ -44,6 +44,7 @@ pub struct Server<Tin, Tout, C> {
     local_addr: SocketAddr,
     connections: Arc<RwLock<HashMap<SocketAddr, SenderWithResult<Tout>>>>,
     shutdown: Arc<AtomicBool>,
+    active_lock: Arc<RwLock<()>>,
     _marker: PhantomData<(Tin, C)>,
 }
 
@@ -74,18 +75,27 @@ where
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
 
+        let active_lock = Arc::new(RwLock::new(()));
+        let active_lock2 = active_lock.clone();
+
         std::thread::spawn(move || {
+            let handle = active_lock2.write().unwrap();
+
             Self::accept_connections(listener, connections2.clone(), sink, codec, shutdown2);
 
             // accept_connections will only finish, once it received the shutdown signal.
             // We need to clear exising connections here, so that we do not leak resources.
             // --> all channels will be closed and background threads will terminate
             connections2.write().unwrap().clear();
+
+            // signal that shutdown is complete
+            drop(handle);
         });
 
         Ok(Self {
             local_addr,
             shutdown,
+            active_lock,
             connections,
             _marker: PhantomData,
         })
@@ -158,7 +168,9 @@ where
         // Task to send messages to the client (write half)
         let (client_tx, client_rx) = mpsc::channel();
         connections.write().unwrap().insert(addr, client_tx);
-        data_tx.send((addr, Event::Connect)).unwrap();
+        if data_tx.send((addr, Event::Connect)).is_err() {
+            return;
+        }
 
         let codec2 = codec.clone();
         // send and receive all messages
@@ -166,8 +178,8 @@ where
         Self::read_messages(addr, &mut reader, codec, data_tx.clone());
 
         connections.write().unwrap().remove(&addr);
-        reader.shutdown(std::net::Shutdown::Both).unwrap();
-        data_tx.send((addr, Event::Disconnect)).unwrap();
+        let _ = reader.shutdown(std::net::Shutdown::Both);
+        let _ = data_tx.send((addr, Event::Disconnect));
     }
 
     fn read_messages(
@@ -223,7 +235,7 @@ where
 
             let _ = tx_result.send(result);
         }
-
+        let _ = writer.shutdown(std::net::Shutdown::Both);
         Ok(())
     }
 }
@@ -236,5 +248,9 @@ impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
 
         // spawn a connection, to continue the accept_connections loop and check shutdown state
         let _ = TcpStream::connect(self.local_addr);
+
+        // wait for accept_connections to drop the lock guard
+        // this is a poor-mans condvar
+        let _handle = self.active_lock.write();
     }
 }
