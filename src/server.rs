@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,7 +62,6 @@ where
         C: Codec<Tin, Tout>,
     {
         let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
 
         // fetch local addr in case we were bound to any port
         let local_addr = listener
@@ -81,6 +79,7 @@ where
 
             // accept_connections will only finish, once it received the shutdown signal.
             // We need to clear exising connections here, so that we do not leak resources.
+            // --> all channels will be closed and background threads will terminate
             connections2.write().unwrap().clear();
         });
 
@@ -127,15 +126,12 @@ where
         shutdown: Arc<AtomicBool>,
     ) {
         loop {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
             match listener.accept() {
-                Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => {
-                        if shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                    }
-                    e => panic!("{:?}", e),
-                },
+                Err(e) => panic!("{e}"), // TODO: what to do here?
 
                 Ok((socket, addr)) => {
                     let connections2 = connections.clone();
@@ -233,13 +229,12 @@ where
 }
 
 impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
+    // Send shutdown signal to acceptor task.
+    // This will terminate the accept loop and close all existing connections.
     fn drop(&mut self) {
-        // Send shutdown signal to acceptor task.
-        //   This will terminate the accept loop and close all exisitng connections.
-        //   Clearing exising connections is important, as the TcpStreams will continue to live,
-        //      even when there is no real access to them anymore.
-        // NOTE: We ignore the return value, since SendErrors only occur, when the receiver has been dropped.
-        //       In that case, the background task is already terminated.
         self.shutdown.store(true, Ordering::SeqCst);
+
+        // spawn a connection, to continue the accept_connections loop and check shutdown state
+        let _ = TcpStream::connect(self.local_addr);
     }
 }
