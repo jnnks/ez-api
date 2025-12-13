@@ -15,8 +15,9 @@ use crate::{Codec, Continue};
 // We forward the operating systems TCP socket buffer limitations
 // to the caller of Server::send. If the OS buffer is full, the caller has to
 // wait
-type SenderWithResult<Tout> = mpsc::Sender<(mpsc::Sender<Result<(), SendError>>, Tout)>;
-type ReceiverWithResult<Tout> = mpsc::Receiver<(mpsc::Sender<Result<(), SendError>>, Tout)>;
+type ResponseSender = mpsc::SyncSender<Result<(), SendError>>;
+type SenderWithResult<Tout> = mpsc::Sender<(ResponseSender, Tout)>;
+type ReceiverWithResult<Tout> = mpsc::Receiver<(ResponseSender, Tout)>;
 
 #[derive(Debug)]
 pub enum Event<Trecv, TCodecErr> {
@@ -93,7 +94,7 @@ where
 
     pub fn send(&self, who: SocketAddr, value: Tout) -> Result<(), SendError> {
         if let Some(conn) = self.connections.read().unwrap().get(&who) {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(1);
             conn.send((tx, value))
                 .map_err(|_| SendError::BrokenChannel)?;
 
@@ -156,7 +157,7 @@ where
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
     ) {
         // Split the socket into a read and write half
-        let (reader, writer) = (stream.try_clone().unwrap(), stream);
+        let (mut reader, writer) = (stream.try_clone().unwrap(), stream);
 
         // Task to send messages to the client (write half)
         let (client_tx, client_rx) = mpsc::channel();
@@ -166,24 +167,25 @@ where
         let codec2 = codec.clone();
         // send and receive all messages
         std::thread::spawn(move || Self::send_messages(client_rx, codec2, writer));
-        Self::read_messages(addr, reader, codec, data_tx.clone());
+        Self::read_messages(addr, &mut reader, codec, data_tx.clone());
 
         connections.write().unwrap().remove(&addr);
+        reader.shutdown(std::net::Shutdown::Both).unwrap();
         data_tx.send((addr, Event::Disconnect)).unwrap();
     }
 
     fn read_messages(
         peer: SocketAddr,
-        mut reader: TcpStream,
+        reader: &mut TcpStream,
         codec: C,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
     ) {
         loop {
-            let buffer = match crate::read_write::receive_next(&mut reader) {
+            let buffer = match crate::read_write::receive_next(reader) {
                 Ok(mesg) => mesg,
                 Err(e) => {
                     let _ = data_tx.send((peer, Event::Err(ReceiveError::IoError(e))));
-                    break;
+                    return;
                 }
             };
 
@@ -203,7 +205,7 @@ where
 
                 Err((e, Continue(false))) => {
                     let _ = data_tx.send((peer, Event::Err(ReceiveError::Codec(e))));
-                    break;
+                    return;
                 }
             };
 
@@ -211,7 +213,6 @@ where
                 break;
             }
         }
-        reader.shutdown(std::net::Shutdown::Both).unwrap();
     }
 
     fn send_messages(
