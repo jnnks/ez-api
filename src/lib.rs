@@ -50,7 +50,7 @@ mod read_write {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use crate::{
         Client, Codec, Continue, Server, client,
@@ -72,15 +72,19 @@ mod tests {
     type StringServer = Server<String, String, StringCodec>;
     type StringClient = Client<String, String, StringCodec>;
 
+    const ANY_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
+
     #[test]
     fn test_connect_disconnect_1() {
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let (sink, srv_rx) = std::sync::mpsc::channel();
-        let _server: StringServer = Server::bind(addr, StringCodec {}, sink).unwrap();
-        let (sink, _clt_rx) = std::sync::mpsc::channel();
-        let client: StringClient = Client::connect(addr, StringCodec {}, sink).unwrap();
+        // establish connection and drop client
 
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let server: StringServer = Server::bind(ANY_ADDR, StringCodec {}, sink).unwrap();
+        let (sink, _clt_rx) = std::sync::mpsc::channel();
+        let client: StringClient =
+            Client::connect(server.local_addr(), StringCodec {}, sink).unwrap();
         assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+
         drop(client);
         assert!(matches!(
             srv_rx.recv(),
@@ -91,17 +95,42 @@ mod tests {
 
     #[test]
     fn test_connect_disconnect_2() {
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let (sink, srv_rx) = std::sync::mpsc::channel();
+        // establish connection and drop server
 
-        let server: StringServer = Server::bind(addr, StringCodec {}, sink).unwrap();
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let server: StringServer = Server::bind(ANY_ADDR, StringCodec {}, sink).unwrap();
 
         let (sink, clt_rx) = std::sync::mpsc::channel();
-        let client: StringClient = Client::connect(addr, StringCodec {}, sink).unwrap();
-
+        let client: StringClient =
+            Client::connect(server.local_addr(), StringCodec {}, sink).unwrap();
         assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+
         drop(server);
 
+        assert!(matches!(
+            clt_rx.recv().unwrap(),
+            Err(client::ReceiveError::IoError(_))
+        ));
+        assert!(!client.online());
+    }
+
+    #[test]
+    fn test_connect_disconnect_3() {
+        // establish connection and drop server main data channel
+
+        let (sink, srv_rx) = std::sync::mpsc::channel();
+        let server: StringServer = Server::bind(ANY_ADDR, StringCodec {}, sink).unwrap();
+
+        let (sink, clt_rx) = std::sync::mpsc::channel();
+        let mut client: StringClient =
+            Client::connect(server.local_addr(), StringCodec {}, sink).unwrap();
+        assert!(matches!(srv_rx.recv(), Ok((_, Event::Connect))));
+
+        drop(srv_rx);
+
+        // sending data will make server try to send into srv_rx, this will fail and the connection
+        // is shutdown
+        client.send("hello".into()).unwrap();
         assert!(matches!(
             clt_rx.recv().unwrap(),
             Err(client::ReceiveError::IoError(_))

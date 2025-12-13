@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
+use std::thread::JoinHandle;
 
 use crate::{Codec, Continue};
 
@@ -81,12 +82,27 @@ where
         std::thread::spawn(move || {
             let handle = active_lock2.write().unwrap();
 
-            Self::accept_connections(listener, connections2.clone(), sink, codec, shutdown2);
+            let connection_handles = Arc::new(RwLock::new(vec![]));
+            let connection_handles2 = connection_handles.clone();
+
+            Self::accept_connections(
+                listener,
+                connections2.clone(),
+                connection_handles2.clone(),
+                sink,
+                codec,
+                shutdown2,
+            );
 
             // accept_connections will only finish, once it received the shutdown signal.
             // We need to clear exising connections here, so that we do not leak resources.
             // --> all channels will be closed and background threads will terminate
             connections2.write().unwrap().clear();
+
+            // wait for all connection threads to complete gracefully
+            for handle in connection_handles2.write().unwrap().drain(..) {
+                let _ = handle.join();
+            }
 
             // signal that shutdown is complete
             drop(handle);
@@ -131,6 +147,7 @@ where
     fn accept_connections(
         listener: TcpListener,
         connections: Arc<RwLock<HashMap<SocketAddr, SenderWithResult<Tout>>>>,
+        connection_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
         data_tx: mpsc::Sender<(SocketAddr, Event<Tin, C::TErr>)>,
         codec: C,
         shutdown: Arc<AtomicBool>,
@@ -147,9 +164,10 @@ where
                     let connections2 = connections.clone();
                     let data_tx2 = data_tx.clone();
                     let codec2 = codec.clone();
-                    std::thread::spawn(move || {
+                    let handle = std::thread::spawn(move || {
                         Self::handle_connection(addr, socket, codec2, connections2, data_tx2)
                     });
+                    connection_handles.write().unwrap().push(handle);
                 }
             }
         }
@@ -218,6 +236,7 @@ where
             };
 
             if data_tx.send((peer, Event::Data(message))).is_err() {
+                // TODO: main data sink has been dropped, how to handle this better?
                 break;
             }
         }
@@ -247,7 +266,9 @@ impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
         self.shutdown.store(true, Ordering::SeqCst);
 
         // spawn a connection, to continue the accept_connections loop and check shutdown state
-        let _ = TcpStream::connect(self.local_addr);
+        if let Ok(conn) = TcpStream::connect(self.local_addr) {
+            conn.shutdown(std::net::Shutdown::Both).unwrap();
+        }
 
         // wait for accept_connections to drop the lock guard
         // this is a poor-mans condvar
