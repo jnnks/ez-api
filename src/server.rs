@@ -55,6 +55,9 @@ where
     Tout: Send + 'static + Debug,
     C: Codec<Tin, Tout> + Clone + 'static,
 {
+    /// Bind a Server to a port.
+    ///
+    /// Will spawn a backgroud thread to handle incoming connections and two threads for each connected client.
     pub fn bind(
         addr: SocketAddr,
         codec: C,
@@ -64,11 +67,7 @@ where
         C: Codec<Tin, Tout>,
     {
         let listener = TcpListener::bind(addr)?;
-
-        // fetch local addr in case we were bound to any port
-        let local_addr = listener
-            .local_addr()
-            .expect("Cannot Retrieve Local Address");
+        let local_addr = listener.local_addr()?;
 
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let connections2 = connections.clone();
@@ -117,6 +116,7 @@ where
         })
     }
 
+    /// Send a message to a client.
     pub fn send(&self, who: SocketAddr, value: Tout) -> Result<(), SendError> {
         if let Some(conn) = self.connections.read().unwrap().get(&who) {
             let (tx, rx) = mpsc::sync_channel(1);
@@ -130,6 +130,7 @@ where
         }
     }
 
+    // Send a message to all clients.
     pub fn broadcast(&self, value: Tout)
     where
         Tout: Clone,
@@ -140,6 +141,7 @@ where
         }
     }
 
+    // Returns the local socket address of this listener.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }

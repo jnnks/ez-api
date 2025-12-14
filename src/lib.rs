@@ -1,9 +1,11 @@
-pub mod client;
-pub mod server;
+//! Simple MPSC TCP Message Queues
+
+mod client;
+mod server;
 use std::fmt::Debug;
 
 pub use client::Client;
-pub use server::Server;
+pub use server::{Event, Server};
 
 pub struct Continue(pub bool);
 
