@@ -52,7 +52,11 @@ mod read_write {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        io::ErrorKind,
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        time::Duration,
+    };
 
     use crate::{
         Client, Codec, Continue, Server, client,
@@ -137,6 +141,48 @@ mod tests {
             clt_rx.recv().unwrap(),
             Err(client::ReceiveError::IoError(_))
         ));
+        assert!(!client.online());
+    }
+
+    #[test]
+    fn test_connect_no_server() {
+        // try connecting to a port without server
+
+        let (sink, _clt_rx) = std::sync::mpsc::channel();
+        let result: Result<Client<String, String, StringCodec>, std::io::Error> =
+            Client::connect(ANY_ADDR, StringCodec {}, sink);
+
+        let Err(e) = result else {
+            panic!("did not return Err(_)")
+        };
+        assert_eq!(ErrorKind::ConnectionRefused, e.kind());
+    }
+
+    #[test]
+    fn test_connect_cancel_message() {
+        #[derive(Clone)]
+        struct RawCodec;
+        impl Codec<Vec<u8>, Vec<u8>> for RawCodec {
+            type TErr = String;
+            fn encode(&self, outgoing: Vec<u8>) -> Vec<u8> {
+                outgoing
+            }
+            fn decode(&self, incoming: Vec<u8>) -> Result<Vec<u8>, (Self::TErr, Continue)> {
+                Ok(incoming)
+            }
+        }
+
+        let (sink, _srv_rx) = std::sync::mpsc::channel();
+        let server: Server<Vec<u8>, Vec<u8>, RawCodec> =
+            Server::bind(ANY_ADDR, RawCodec {}, sink).unwrap();
+
+        let (sink, _clt_rx) = std::sync::mpsc::channel();
+        let mut client: Client<Vec<u8>, Vec<u8>, RawCodec> =
+            Client::connect(server.local_addr(), RawCodec {}, sink).unwrap();
+        // send empty message
+        client.send(vec![]).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
         assert!(!client.online());
     }
 

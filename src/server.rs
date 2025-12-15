@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::{Codec, Continue};
 
@@ -162,7 +164,18 @@ where
             match listener.accept() {
                 Err(e) => panic!("{e}"), // TODO: what to do here?
 
-                Ok((socket, addr)) => {
+                Ok((mut socket, addr)) => {
+                    match keep_connection_alive(&mut socket) {
+                        Ok(true) => { /* ok */ }
+                        Ok(false) => continue,
+                        Err(e) => {
+                            let event = (addr, Event::Err(ReceiveError::IoError(e)));
+                            if data_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+
                     let connections2 = connections.clone();
                     let data_tx2 = data_tx.clone();
                     let codec2 = codec.clone();
@@ -268,7 +281,8 @@ impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
         self.shutdown.store(true, Ordering::SeqCst);
 
         // spawn a connection, to continue the accept_connections loop and check shutdown state
-        if let Ok(conn) = TcpStream::connect(self.local_addr) {
+        if let Ok(mut conn) = TcpStream::connect(self.local_addr) {
+            conn.write(&[0, 0, 0, 0]).unwrap();
             conn.shutdown(std::net::Shutdown::Both).unwrap();
         }
 
@@ -276,4 +290,29 @@ impl<Tin, Tout, C> Drop for Server<Tin, Tout, C> {
         // this is a poor-mans condvar
         let _handle = self.active_lock.write();
     }
+}
+
+fn keep_connection_alive(socket: &mut TcpStream) -> std::io::Result<bool> {
+    // let _ = socket.set_nonblocking(true);
+    socket.set_read_timeout(Some(Duration::from_micros(1)))?;
+
+    let keep_alive = {
+        let mut buf = [0u8; 4];
+
+        match socket.peek(&mut buf) {
+            Ok(4) if buf == [0, 0, 0, 0] => {
+                println!("drop recvd");
+                Ok(false)
+            }
+            // FIXME: What to do here? Length is too short
+            Ok(_l) => Ok(false),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(true),
+            Err(e) => Err(e),
+        }
+    };
+
+    // let _ = socket.set_nonblocking(false);
+    socket.set_read_timeout(None)?;
+
+    keep_alive
 }
