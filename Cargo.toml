@@ -2,5 +2,8 @@
 name = "ez-api"
 version = "0.1.0"
 edition = "2024"
+license = "0BSD"
+description = "MPSC TCP Data Exchange Limited to the Rust Standard Library"
+repository = "https://github.com/jnnks/ez-api"
 
 [dependencies]
